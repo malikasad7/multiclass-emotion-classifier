@@ -1,0 +1,212 @@
+
+!pip install -q transformers datasets accelerate evaluate scikit-learn seaborn
+
+import os
+import re
+import string
+import numpy as np
+import pandas as pd
+import torch
+
+from datasets import load_dataset, Dataset, DatasetDict
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from transformers import (
+    RobertaTokenizerFast,                 
+    AutoModelForSequenceClassification,   # PyTorch model class
+    DataCollatorWithPadding,
+    TrainingArguments,
+    Trainer,
+    EarlyStoppingCallback,
+)
+
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Load dataset
+
+ds = load_dataset("AdamCodd/emotion-balanced")  # single 'train' split (balanced)
+df = ds["train"].to_pandas()
+
+# Label map (0–5) as specified:
+id2label = {0: "sadness", 1: "joy", 2: "love", 3: "anger", 4: "fear", 5: "surprise"}
+label2id = {v: k for k, v in id2label.items()}
+
+
+#  Text cleaning (light)
+
+def clean_text(text: str) -> str:
+    text = str(text).lower()
+    text = re.sub(r"http\S+|www\S+", " ", text)        # URLs
+    text = re.sub(f"[{re.escape(string.punctuation)}]", " ", text)  # punctuation -> space
+    text = re.sub(r"\d+", " ", text)                   # numbers
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+df["text"] = df["text"].astype(str).apply(clean_text)
+df["label"] = df["label"].astype(int)
+
+# Make stratified Train/Val/Test = 80/10/10
+
+X_train, X_temp, y_train, y_temp = train_test_split(
+    df["text"], df["label"], test_size=0.20, random_state=SEED, stratify=df["label"]
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.50, random_state=SEED, stratify=y_temp
+)
+
+train_df = pd.DataFrame({"text": X_train, "label": y_train})
+val_df   = pd.DataFrame({"text": X_val,   "label": y_val})
+test_df  = pd.DataFrame({"text": X_test,  "label": y_test})
+
+# Convert to Hugging Face Datasets
+train_ds = Dataset.from_pandas(train_df.reset_index(drop=True))
+val_ds   = Dataset.from_pandas(val_df.reset_index(drop=True))
+test_ds  = Dataset.from_pandas(test_df.reset_index(drop=True))
+
+dataset = DatasetDict({"train": train_ds, "validation": val_ds, "test": test_ds})
+
+
+#  Tokenizer
+
+MODEL_NAME = "roberta-base"   # <-- CHANGE (RoBERTa-base)
+tokenizer = RobertaTokenizerFast.from_pretrained(MODEL_NAME)
+
+def tokenize_fn(batch):
+    return tokenizer(batch["text"], truncation=True)
+
+tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
+
+# Data collator pads dynamically
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+#  Model (PyTorch) with label mappings
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=6,
+    id2label=id2label,
+    label2id=label2id
+)
+
+#  Metrics function
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc}
+
+#  Training arguments (avoid overfitting)
+args = TrainingArguments(
+    output_dir="roberta_emotion_out",  
+    eval_strategy="epoch",        
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+
+    num_train_epochs=6,
+    per_device_train_batch_size=32,
+    per_device_eval_batch_size=64,
+    learning_rate=2e-5,
+    weight_decay=0.01,
+    warmup_ratio=0.06,
+    lr_scheduler_type="linear",
+
+    logging_steps=50,
+    save_total_limit=2,
+    seed=SEED,
+    report_to="none"
+)
+
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=tokenized["train"],
+    eval_dataset=tokenized["validation"],
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
+)
+
+#  Train
+train_result = trainer.train()
+
+#  Evaluate
+val_metrics = trainer.evaluate(tokenized["validation"])
+print("\n=== Validation metrics ===")
+print(val_metrics)
+
+train_metrics = trainer.evaluate(tokenized["train"])
+print("\n=== Training metrics (eval on train split) ===")
+print(train_metrics)
+
+test_metrics = trainer.evaluate(tokenized["test"])
+print("\n=== Test metrics ===")
+print(test_metrics)
+
+#  Detailed reports + Confusion matrices
+def predict_split(name, tokenized_split, y_true):
+    preds_output = trainer.predict(tokenized_split)
+    y_prob = preds_output.predictions
+    y_pred = np.argmax(y_prob, axis=1)
+    print(f"\n=== {name} Classification Report ===")
+    print(classification_report(y_true, y_pred, target_names=[id2label[i] for i in range(6)]))
+
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8,6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=[id2label[i] for i in range(6)],
+                yticklabels=[id2label[i] for i in range(6)] )
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title(f"{name} Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
+
+y_val_np  = np.array(val_df["label"].tolist())
+y_test_np = np.array(test_df["label"].tolist())
+
+predict_split("Validation", tokenized["validation"], y_val_np)
+predict_split("Test", tokenized["test"], y_test_np)
+
+#  Demo predictions on mock sentences
+demo_sentences = [
+    "I am so happy today, everything feels wonderful!",   # joy
+    "I hate being ignored, it makes me furious!",         # anger
+    "I feel so alone and sad right now.",                 # sadness
+    "I can't believe this happened, what a shock!",       # surprise
+    "I love spending time with you.",                     # love
+    "I'm worried about the future, it's scary.",          # fear
+    "This was unexpected, I'm stunned!",                  # surprise
+    "My heart is full when I'm with you.",                # love
+    "I’m terrified of what might happen next.",           # fear
+    "Nothing special today, just an ordinary day."        # sadness/neutral-ish
+]
+
+enc = tokenizer(demo_sentences, padding=True, truncation=True, return_tensors="pt")
+if torch.cuda.is_available():
+    model.to("cuda")
+    enc = {k: v.to("cuda") for k, v in enc.items()}
+
+with torch.no_grad():
+    outputs = model(**enc)
+probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
+pred_ids = probs.argmax(axis=-1)
+
+print("\n=== Demo Predictions ===")
+for sent, pid in zip(demo_sentences, pred_ids):
+    print(f"{sent} → {id2label[int(pid)]}")
+
+#  Save model & tokenizer
+save_dir = "roberta_emotion_best"  
+trainer.save_model(save_dir)
+tokenizer.save_pretrained(save_dir)
+print(f"\nSaved best model & tokenizer to: {save_dir}")
